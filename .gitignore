@@ -1,0 +1,6 @@
+hbot
+hbot.exe
+hbot-linux-amd64
+hbot-linux-arm64
+.gocache/
+.idea/
