@@ -29,32 +29,33 @@ build-linux.bat
 
 It creates both `hbot-linux-amd64` and `hbot-linux-arm64`.
 
-## Publish Installer
+## Publish
 
-Put these files under the same HTTP directory:
+Create a GitHub Release and upload only these assets:
 
 ```text
-install-hbot.sh
 hbot-linux-amd64
 hbot-linux-arm64
 ```
 
-For example, if the directory URL is:
+The installer script stays in the Git repository and can be downloaded from `raw.githubusercontent.com`, similar to common one-line installers.
 
-```text
-https://your-domain.com/hbot
-```
-
-install with:
+Install latest release:
 
 ```bash
-curl -fsSL https://your-domain.com/hbot/install-hbot.sh | HBOT_BASE_URL=https://your-domain.com/hbot sh
+curl -fsSL https://raw.githubusercontent.com/ranhongfeixue/hbot/master/install-hbot.sh | sh
 ```
 
 or:
 
 ```bash
-wget -O - https://your-domain.com/hbot/install-hbot.sh | HBOT_BASE_URL=https://your-domain.com/hbot sh
+wget -O - https://raw.githubusercontent.com/ranhongfeixue/hbot/master/install-hbot.sh | sh
+```
+
+Pin a specific release tag if needed:
+
+```bash
+wget -O - https://raw.githubusercontent.com/ranhongfeixue/hbot/master/install-hbot.sh | HBOT_BASE_URL=https://github.com/ranhongfeixue/hbot/releases/download/v1.0.0 sh
 ```
 
 The installer downloads the right binary for `amd64` or `arm64`, installs it as `hbot` under a global `PATH` directory, and makes it executable. It prefers `/usr/local/bin`; if that is not in `PATH`, it uses `/usr/bin`.

@@ -1,10 +1,10 @@
 #!/bin/sh
 set -eu
 
-# Put hbot-linux-amd64 and hbot-linux-arm64 under this URL.
+# Put hbot-linux-amd64 and hbot-linux-arm64 in GitHub Releases.
 # You can also override it at runtime:
-#   HBOT_BASE_URL=https://your-domain.com/hbot sh install-hbot.sh
-HBOT_BASE_URL="${HBOT_BASE_URL:-https://example.com/hbot}"
+#   HBOT_BASE_URL=https://github.com/ranhongfeixue/hbot/releases/download/v1.0.0 sh install-hbot.sh
+HBOT_BASE_URL="${HBOT_BASE_URL:-https://github.com/ranhongfeixue/hbot/releases/latest/download}"
 if [ -z "${HBOT_BIN_DIR:-}" ]; then
   case ":${PATH:-}:" in
     *:/usr/local/bin:*)
