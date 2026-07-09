@@ -38,24 +38,30 @@ hbot-linux-amd64
 hbot-linux-arm64
 ```
 
-The installer script stays in the Git repository and can be downloaded from `raw.githubusercontent.com`, similar to common one-line installers.
+The installer script stays in the Git repository. Use jsDelivr first because `raw.githubusercontent.com` can return `429 Too Many Requests` on shared NAT IPs.
 
 Install latest release:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ranhongfeixue/hbot/master/install-hbot.sh | sh
+curl -fsSL https://cdn.jsdelivr.net/gh/ranhongfeixue/hbot@master/install-hbot.sh | sh
 ```
 
 or:
 
 ```bash
-wget -O - https://raw.githubusercontent.com/ranhongfeixue/hbot/master/install-hbot.sh | sh
+wget -O - https://cdn.jsdelivr.net/gh/ranhongfeixue/hbot@master/install-hbot.sh | sh
 ```
 
 Pin a specific release tag if needed:
 
 ```bash
-wget -O - https://raw.githubusercontent.com/ranhongfeixue/hbot/master/install-hbot.sh | HBOT_BASE_URL=https://github.com/ranhongfeixue/hbot/releases/download/v1.0.0 sh
+wget -O - https://cdn.jsdelivr.net/gh/ranhongfeixue/hbot@master/install-hbot.sh | HBOT_BASE_URL=https://github.com/ranhongfeixue/hbot/releases/download/v1.0.0 sh
+```
+
+Raw GitHub fallback:
+
+```bash
+wget -O - https://raw.githubusercontent.com/ranhongfeixue/hbot/master/install-hbot.sh | sh
 ```
 
 The installer downloads the right binary for `amd64` or `arm64`, installs it as `hbot` under a global `PATH` directory, and makes it executable. It prefers `/usr/local/bin`; if that is not in `PATH`, it uses `/usr/bin`.
