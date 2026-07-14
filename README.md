@@ -10,8 +10,10 @@ It is intentionally narrow:
 - fallback to hbot-managed background mode when `systemctl` is unavailable
 - try to enable BBR; failures are warnings
 - add Shadowsocks and VLESS TCP Reality inbounds
+- add HTTP exit outbounds
+- route selected inbound nodes through selected exits
 - export Clash `proxies` config
-- start, restart, and stop `sing-box`
+- show status, start, restart, and stop `sing-box`
 
 The config format targets current `sing-box` 1.13.x.
 
@@ -98,9 +100,12 @@ After setup, it opens the function menu:
 ```text
 1) add
 2) export
-3) restart
-4) start
-5) stop
+3) status
+4) add exit
+5) rules
+6) restart
+7) start
+8) stop
 0) exit
 ```
 
@@ -137,10 +142,68 @@ VLESS Reality defaults:
 - SNI: `www.nvidia.com`
 - UUID: generated automatically
 - Reality private/public key pair: generated automatically
-- short id: 5 random hex characters
+- short id: 8 random hex characters
 - fingerprint: `chrome`
 
 After a profile is added, hbot checks the generated sing-box config and restarts sing-box so the new inbound takes effect immediately.
+
+## Status
+
+Choose `status` to show:
+
+- service state
+- state and config paths
+- initialized server
+- profiles and their current exit
+- configured outbounds
+- inbound-to-exit rules
+
+Profiles without an explicit rule use their own/direct server exit.
+
+## Add Exit
+
+Choose `add exit` to add an HTTP outbound.
+
+The flow asks for:
+
+- name
+- HTTP server domain/IP
+- port
+- optional username and password
+
+The generated sing-box outbound uses:
+
+```json
+{
+  "type": "http",
+  "tag": "http-proxy",
+  "server": "proxy.example.com",
+  "server_port": 8080
+}
+```
+
+Adding an exit does not change any profile by itself.
+
+## Rules
+
+Choose `rules` to select which profiles should use an HTTP exit.
+
+The flow asks for:
+
+- exit: an HTTP exit, or `direct` to clear the rule
+- profiles: all or selected numbers
+
+hbot writes sing-box route rules in this shape:
+
+```json
+{
+  "inbound": ["ss-tw"],
+  "action": "route",
+  "outbound": "http-proxy"
+}
+```
+
+Only selected profiles get explicit rules. Profiles without rules keep the default direct/own exit.
 
 ## Export Clash
 
@@ -167,7 +230,7 @@ All random values use Go `crypto/rand`.
 - Shadowsocks password: 32 random bytes, base64url encoded. About 256 bits.
 - VLESS UUID: UUID v4. About 122 random bits.
 - Reality private key: generated X25519 key. The public key is derived from it and becomes the client `pbk`.
-- Reality short id: 5 random hex characters. This is 20 bits, so there are 1,048,576 possible values.
+- Reality short id: 8 random hex characters. This is 32 bits, so there are 4,294,967,296 possible values.
 - `spx`: 8 random bytes, base64url encoded, used as a generated path-like value in the share link.
 
-For one personal server with a small number of profiles, collisions are effectively irrelevant except the 5-character short id, which is intentionally much smaller.
+For one personal server with a small number of profiles, collisions are effectively irrelevant.

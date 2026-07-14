@@ -59,15 +59,18 @@ func TestRealityKeypairCanDerivePublicKey(t *testing.T) {
 }
 
 func TestRandomHexChars(t *testing.T) {
-	value, err := randomHexChars(5)
+	value, err := randomHexChars(defaultRealityShortIDLen)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(value) != 5 {
-		t.Fatalf("len = %d, want 5", len(value))
+	if len(value) != defaultRealityShortIDLen {
+		t.Fatalf("len = %d, want %d", len(value), defaultRealityShortIDLen)
 	}
 	if err := validateShortID(value); err != nil {
 		t.Fatalf("generated invalid short id %q: %v", value, err)
+	}
+	if err := validateShortID("abc"); err == nil {
+		t.Fatal("expected odd-length short id to be rejected")
 	}
 }
 
@@ -300,8 +303,8 @@ func TestAddVLESSRealityUsesDefaults(t *testing.T) {
 	if p.SNI != defaultRealitySNI {
 		t.Fatalf("SNI = %q, want %q", p.SNI, defaultRealitySNI)
 	}
-	if len(p.ShortID) != 5 {
-		t.Fatalf("short id = %q, want length 5", p.ShortID)
+	if len(p.ShortID) != defaultRealityShortIDLen {
+		t.Fatalf("short id = %q, want length %d", p.ShortID, defaultRealityShortIDLen)
 	}
 	if p.PrivateKey == "" || p.PublicKey == "" || p.UUID == "" {
 		t.Fatalf("expected generated reality credentials: %#v", p)
@@ -362,6 +365,159 @@ func TestAddSSWritesConfigAndState(t *testing.T) {
 	}
 	if len(st.Profiles) != 1 || st.Profiles[0].Network != "both" {
 		t.Fatalf("expected default ss network both: %#v", st.Profiles)
+	}
+}
+
+func TestAddHTTPOutboundWritesConfig(t *testing.T) {
+	dir := t.TempDir()
+	app := appConfig{
+		configPath: filepath.Join(dir, "config.json"),
+		statePath:  filepath.Join(dir, "state.json"),
+		service:    "sing-box",
+	}
+	var out strings.Builder
+	var errOut strings.Builder
+	if err := addHTTPOutbound(app, httpOutboundAddOptions{
+		Name:     "proxy",
+		Server:   "proxy.example.com",
+		Port:     8080,
+		Username: "user",
+		Password: "pass",
+	}, &out, &errOut); err != nil {
+		t.Fatalf("run failed: %v stderr=%s", err, errOut.String())
+	}
+
+	data, err := os.ReadFile(app.configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cfg map[string]any
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	outbounds, ok := cfg["outbounds"].([]any)
+	if !ok || len(outbounds) != 2 {
+		t.Fatalf("unexpected outbounds: %#v", cfg["outbounds"])
+	}
+	direct := outbounds[0].(map[string]any)
+	if direct["type"] != "direct" || direct["tag"] != "direct" {
+		t.Fatalf("direct outbound should stay first: %#v", direct)
+	}
+	httpOutbound := outbounds[1].(map[string]any)
+	for key, want := range map[string]any{
+		"type":        "http",
+		"tag":         "http-proxy",
+		"server":      "proxy.example.com",
+		"server_port": float64(8080),
+		"username":    "user",
+		"password":    "pass",
+	} {
+		if got := httpOutbound[key]; got != want {
+			t.Fatalf("http outbound %s = %#v, want %#v in %#v", key, got, want, httpOutbound)
+		}
+	}
+	if _, ok := cfg["route"]; ok {
+		t.Fatalf("adding an exit should not create route rules by default: %#v", cfg["route"])
+	}
+}
+
+func TestSetInboundExitRulesWritesRouteAction(t *testing.T) {
+	cfg := baseConfig()
+	appendInbound(cfg, map[string]any{"type": "shadowsocks", "tag": "ss-tw", "listen_port": 52501})
+	appendInbound(cfg, map[string]any{"type": "shadowsocks", "tag": "ss-hk", "listen_port": 52502})
+	appendOutbound(cfg, map[string]any{"type": "http", "tag": "http-proxy", "server": "proxy.example.com", "server_port": 8080})
+
+	if err := setInboundExitRules(cfg, []string{"ss-tw"}, "http-proxy"); err != nil {
+		t.Fatal(err)
+	}
+	route := cfg["route"].(map[string]any)
+	rules := route["rules"].([]any)
+	if len(rules) != 1 {
+		t.Fatalf("rules len = %d, want 1: %#v", len(rules), rules)
+	}
+	rule := rules[0].(map[string]any)
+	if rule["action"] != "route" || rule["outbound"] != "http-proxy" {
+		t.Fatalf("unexpected route rule: %#v", rule)
+	}
+	inbound := rule["inbound"].([]any)
+	if len(inbound) != 1 || inbound[0] != "ss-tw" {
+		t.Fatalf("unexpected inbound matcher: %#v", inbound)
+	}
+	exits := inboundExitMap(cfg)
+	if exits["ss-tw"] != "http-proxy" {
+		t.Fatalf("ss-tw exit = %q, want http-proxy", exits["ss-tw"])
+	}
+	if exits["ss-hk"] != "" {
+		t.Fatalf("ss-hk should keep default exit, got %q", exits["ss-hk"])
+	}
+}
+
+func TestClearInboundExitRuleKeepsUnmanagedRules(t *testing.T) {
+	cfg := baseConfig()
+	appendOutbound(cfg, map[string]any{"type": "http", "tag": "http-proxy", "server": "proxy.example.com", "server_port": 8080})
+	route := ensureRoute(cfg)
+	route["rules"] = []any{
+		map[string]any{"inbound": []any{"ss-tw", "ss-hk"}, "action": "route", "outbound": "http-proxy"},
+		map[string]any{"inbound": []any{"ss-us"}, "domain": []any{"example.com"}, "action": "route", "outbound": "http-proxy"},
+	}
+
+	if err := setInboundExitRules(cfg, []string{"ss-tw"}, "direct"); err != nil {
+		t.Fatal(err)
+	}
+	rules := route["rules"].([]any)
+	if len(rules) != 2 {
+		t.Fatalf("rules len = %d, want 2: %#v", len(rules), rules)
+	}
+	trimmed := rules[0].(map[string]any)
+	inbound := trimmed["inbound"].([]any)
+	if len(inbound) != 1 || inbound[0] != "ss-hk" {
+		t.Fatalf("expected grouped simple rule to keep only ss-hk: %#v", trimmed)
+	}
+	complex := rules[1].(map[string]any)
+	if _, ok := complex["domain"]; !ok {
+		t.Fatalf("complex unmanaged rule should be kept: %#v", complex)
+	}
+}
+
+func TestShowStatusDisplaysExitRules(t *testing.T) {
+	dir := t.TempDir()
+	app := appConfig{
+		configPath: filepath.Join(dir, "config.json"),
+		statePath:  filepath.Join(dir, "state.json"),
+		service:    "sing-box",
+	}
+	if err := saveState(app.statePath, stateFile{
+		Server: "example.com",
+		Profiles: []profile{
+			{Type: "ss", Name: "TW", Tag: "ss-tw", Port: 52501},
+			{Type: "ss", Name: "HK", Tag: "ss-hk", Port: 52502},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := baseConfig()
+	appendOutbound(cfg, map[string]any{"type": "http", "tag": "http-proxy", "server": "proxy.example.com", "server_port": 8080})
+	if err := setInboundExitRules(cfg, []string{"ss-tw"}, "http-proxy"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writeConfig(app.configPath, cfg); err != nil {
+		t.Fatal(err)
+	}
+
+	var out strings.Builder
+	if err := showStatus(app, &out); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"service:",
+		"ss  TW  :52501  tag=ss-tw  exit=http-proxy",
+		"ss  HK  :52502  tag=ss-hk  exit=direct (own)",
+		"http-proxy  http  proxy.example.com:8080",
+		"ss-tw -> http-proxy",
+	} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("missing %q in:\n%s", want, out.String())
+		}
 	}
 }
 
