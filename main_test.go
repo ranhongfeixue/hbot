@@ -3,11 +3,13 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestUUID(t *testing.T) {
@@ -219,6 +221,79 @@ func TestSelectProfiles(t *testing.T) {
 	}
 	if len(all) != 3 {
 		t.Fatalf("all len = %d, want 3", len(all))
+	}
+}
+
+func TestCollectNodeTestTargetsIncludesProfilesAndHTTPExits(t *testing.T) {
+	dir := t.TempDir()
+	app := appConfig{
+		configPath: filepath.Join(dir, "config.json"),
+		statePath:  filepath.Join(dir, "state.json"),
+		service:    "sing-box",
+	}
+	if err := saveState(app.statePath, stateFile{
+		Server: "example.com",
+		Profiles: []profile{
+			{Type: "ss", Name: "TW", Tag: "ss-tw", Port: 52501},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := baseConfig()
+	appendOutbound(cfg, map[string]any{"type": "http", "tag": "http-proxy", "server": "proxy.example.com", "server_port": 8080})
+	if _, err := writeConfig(app.configPath, cfg); err != nil {
+		t.Fatal(err)
+	}
+
+	targets, err := collectNodeTestTargets(app)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(targets) != 2 {
+		t.Fatalf("targets len = %d, want 2: %#v", len(targets), targets)
+	}
+	if targets[0].Kind != "profile" || targets[0].Server != "example.com" || targets[0].Port != 52501 {
+		t.Fatalf("unexpected profile target: %#v", targets[0])
+	}
+	if targets[1].Kind != "exit" || targets[1].Tag != "http-proxy" || targets[1].Server != "proxy.example.com" {
+		t.Fatalf("unexpected exit target: %#v", targets[1])
+	}
+}
+
+func TestTestNodeTargetsUsesTCPConnectivity(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	accepted := make(chan struct{})
+	go func() {
+		conn, err := listener.Accept()
+		if err == nil {
+			_ = conn.Close()
+		}
+		close(accepted)
+	}()
+
+	port := listener.Addr().(*net.TCPAddr).Port
+	results := testNodeTargets([]nodeTestTarget{{
+		Kind:   "profile",
+		Type:   "ss",
+		Name:   "local",
+		Tag:    "ss-local",
+		Server: "127.0.0.1",
+		Port:   port,
+	}}, 5*time.Second)
+	if len(results) != 1 {
+		t.Fatalf("results len = %d, want 1", len(results))
+	}
+	if results[0].Err != nil {
+		t.Fatalf("test failed: %v", results[0].Err)
+	}
+	select {
+	case <-accepted:
+	case <-time.After(time.Second):
+		t.Fatal("listener did not accept the test connection")
 	}
 }
 
@@ -476,6 +551,110 @@ func TestClearInboundExitRuleKeepsUnmanagedRules(t *testing.T) {
 	complex := rules[1].(map[string]any)
 	if _, ok := complex["domain"]; !ok {
 		t.Fatalf("complex unmanaged rule should be kept: %#v", complex)
+	}
+}
+
+func TestRemoveProfilesDeletesStateInboundAndRouteRules(t *testing.T) {
+	dir := t.TempDir()
+	app := appConfig{
+		configPath: filepath.Join(dir, "config.json"),
+		statePath:  filepath.Join(dir, "state.json"),
+		service:    "sing-box",
+	}
+	if err := saveState(app.statePath, stateFile{
+		Server: "example.com",
+		Profiles: []profile{
+			{Type: "ss", Name: "TW", Tag: "ss-tw", Port: 52501},
+			{Type: "ss", Name: "HK", Tag: "ss-hk", Port: 52502},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := baseConfig()
+	appendInbound(cfg, map[string]any{"type": "shadowsocks", "tag": "ss-tw", "listen": "::", "listen_port": 52501, "method": "aes-256-gcm", "password": "secret1"})
+	appendInbound(cfg, map[string]any{"type": "shadowsocks", "tag": "ss-hk", "listen": "::", "listen_port": 52502, "method": "aes-256-gcm", "password": "secret2"})
+	appendOutbound(cfg, map[string]any{"type": "http", "tag": "http-proxy", "server": "proxy.example.com", "server_port": 8080})
+	route := ensureRoute(cfg)
+	route["rules"] = []any{
+		map[string]any{"inbound": []any{"ss-tw", "ss-hk"}, "action": "route", "outbound": "http-proxy"},
+	}
+	if _, err := writeConfig(app.configPath, cfg); err != nil {
+		t.Fatal(err)
+	}
+
+	var out strings.Builder
+	var errOut strings.Builder
+	if err := removeProfiles(app, []string{"ss-tw"}, false, &out, &errOut); err != nil {
+		t.Fatalf("remove failed: %v stderr=%s", err, errOut.String())
+	}
+
+	st, err := loadState(app.statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(st.Profiles) != 1 || st.Profiles[0].Tag != "ss-hk" {
+		t.Fatalf("unexpected profiles after remove: %#v", st.Profiles)
+	}
+	cfg, err = loadConfig(app.configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inboundTagExists(cfg, "ss-tw") {
+		t.Fatalf("ss-tw inbound still exists: %#v", cfg["inbounds"])
+	}
+	if !inboundTagExists(cfg, "ss-hk") {
+		t.Fatalf("ss-hk inbound should remain: %#v", cfg["inbounds"])
+	}
+	exits := inboundExitMap(cfg)
+	if exits["ss-tw"] != "" {
+		t.Fatalf("ss-tw route should be removed, got %q", exits["ss-tw"])
+	}
+	if exits["ss-hk"] != "http-proxy" {
+		t.Fatalf("ss-hk route = %q, want http-proxy", exits["ss-hk"])
+	}
+}
+
+func TestRemoveHTTPOutboundsDeletesOutboundAndRouteRules(t *testing.T) {
+	dir := t.TempDir()
+	app := appConfig{
+		configPath: filepath.Join(dir, "config.json"),
+		statePath:  filepath.Join(dir, "state.json"),
+		service:    "sing-box",
+	}
+	cfg := baseConfig()
+	appendOutbound(cfg, map[string]any{"type": "http", "tag": "http-proxy", "server": "proxy.example.com", "server_port": 8080})
+	appendOutbound(cfg, map[string]any{"type": "http", "tag": "http-backup", "server": "backup.example.com", "server_port": 8081})
+	route := ensureRoute(cfg)
+	route["rules"] = []any{
+		map[string]any{"inbound": []any{"ss-tw"}, "action": "route", "outbound": "http-proxy"},
+		map[string]any{"inbound": []any{"ss-hk"}, "action": "route", "outbound": "http-backup"},
+	}
+	if _, err := writeConfig(app.configPath, cfg); err != nil {
+		t.Fatal(err)
+	}
+
+	var out strings.Builder
+	var errOut strings.Builder
+	if err := removeHTTPOutbounds(app, []string{"http-proxy"}, false, &out, &errOut); err != nil {
+		t.Fatalf("remove failed: %v stderr=%s", err, errOut.String())
+	}
+
+	cfg, err := loadConfig(app.configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if outboundTagExists(cfg, "http-proxy") {
+		t.Fatalf("http-proxy outbound still exists: %#v", cfg["outbounds"])
+	}
+	if !outboundTagExists(cfg, "http-backup") {
+		t.Fatalf("http-backup outbound should remain: %#v", cfg["outbounds"])
+	}
+	exits := inboundExitMap(cfg)
+	if exits["ss-tw"] != "" {
+		t.Fatalf("ss-tw route should be removed, got %q", exits["ss-tw"])
+	}
+	if exits["ss-hk"] != "http-backup" {
+		t.Fatalf("ss-hk route = %q, want http-backup", exits["ss-hk"])
 	}
 }
 

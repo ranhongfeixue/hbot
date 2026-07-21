@@ -23,6 +23,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -32,6 +33,7 @@ const (
 	defaultService           = "sing-box"
 	defaultRealitySNI        = "www.nvidia.com"
 	defaultRealityShortIDLen = 8
+	defaultNodeTestTimeout   = 5 * time.Second
 	defaultSingBoxVersion    = "1.13.14"
 	singBoxInstallScriptURL  = "https://sing-box.app/install.sh"
 )
@@ -115,6 +117,26 @@ type outboundInfo struct {
 	Server   string
 	Port     int
 	Username string
+}
+
+type nodeTestTarget struct {
+	Kind   string
+	Type   string
+	Name   string
+	Tag    string
+	Server string
+	Port   int
+}
+
+type nodeTestResult struct {
+	Target   nodeTestTarget
+	Duration time.Duration
+	Err      error
+}
+
+type routeCleanupResult struct {
+	Removed int
+	Updated int
 }
 
 func main() {
@@ -244,6 +266,8 @@ func cmdPanel(app appConfig, stdout, stderr io.Writer) error {
 		fmt.Fprintln(stdout, "  6) restart")
 		fmt.Fprintln(stdout, "  7) start")
 		fmt.Fprintln(stdout, "  8) stop")
+		fmt.Fprintln(stdout, "  9) test")
+		fmt.Fprintln(stdout, "  10) remove")
 		fmt.Fprintln(stdout, "  0) exit")
 		choice, err := promptLine(reader, stdout, "Choice: ")
 		if err != nil {
@@ -283,10 +307,18 @@ func cmdPanel(app appConfig, stdout, stderr io.Writer) error {
 			if err := stopSingBox(app, stdout, stderr); err != nil {
 				fmt.Fprintf(stderr, "error: %v\n", err)
 			}
+		case "9", "test", "test-nodes", "test nodes":
+			if err := testNodesInteractive(app, stdout); err != nil {
+				fmt.Fprintf(stderr, "error: %v\n", err)
+			}
+		case "10", "remove", "delete", "rm":
+			if err := removeInteractive(app, reader, stdout, stderr); err != nil {
+				fmt.Fprintf(stderr, "error: %v\n", err)
+			}
 		case "0", "q", "quit", "exit":
 			return nil
 		default:
-			fmt.Fprintln(stdout, "please choose add, export, status, add exit, rules, restart, start, stop, or exit")
+			fmt.Fprintln(stdout, "please choose add, export, status, add exit, rules, restart, start, stop, test, remove, or exit")
 		}
 	}
 }
@@ -1098,6 +1130,404 @@ func addHTTPOutbound(app appConfig, opts httpOutboundAddOptions, stdout, stderr 
 	return nil
 }
 
+func testNodesInteractive(app appConfig, stdout io.Writer) error {
+	targets, err := collectNodeTestTargets(app)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintln(stdout, "Test nodes")
+	if len(targets) == 0 {
+		fmt.Fprintln(stdout, "  none")
+		return nil
+	}
+	fmt.Fprintf(stdout, "timeout: %s\n", defaultNodeTestTimeout)
+	results := testNodeTargets(targets, defaultNodeTestTimeout)
+	okCount := 0
+	for _, result := range results {
+		target := formatNodeTestTarget(result.Target)
+		address := firstNonEmpty(nodeTestAddress(result.Target), "<missing address>")
+		if result.Err != nil {
+			fmt.Fprintf(stdout, "  FAIL %s  %s  %s\n", target, address, formatNodeTestError(result.Err))
+			continue
+		}
+		okCount++
+		fmt.Fprintf(stdout, "  OK   %s  %s  %s\n", target, address, formatDuration(result.Duration))
+	}
+	fmt.Fprintf(stdout, "done: %d ok, %d failed\n", okCount, len(results)-okCount)
+	return nil
+}
+
+func collectNodeTestTargets(app appConfig) ([]nodeTestTarget, error) {
+	st, err := loadState(app.statePath)
+	if err != nil {
+		return nil, err
+	}
+	cfg, err := loadConfigOrBase(app.configPath)
+	if err != nil {
+		return nil, err
+	}
+
+	outbounds := httpOutbounds(cfg)
+	targets := make([]nodeTestTarget, 0, len(st.Profiles)+len(outbounds))
+	for _, p := range st.Profiles {
+		targets = append(targets, nodeTestTarget{
+			Kind:   "profile",
+			Type:   p.Type,
+			Name:   p.Name,
+			Tag:    p.Tag,
+			Server: firstNonEmpty(p.Server, st.Server),
+			Port:   p.Port,
+		})
+	}
+	for _, outbound := range outbounds {
+		targets = append(targets, nodeTestTarget{
+			Kind:   "exit",
+			Type:   outbound.Type,
+			Tag:    outbound.Tag,
+			Server: outbound.Server,
+			Port:   outbound.Port,
+		})
+	}
+	return targets, nil
+}
+
+func testNodeTargets(targets []nodeTestTarget, timeout time.Duration) []nodeTestResult {
+	results := make([]nodeTestResult, len(targets))
+	var wg sync.WaitGroup
+	wg.Add(len(targets))
+	for i := range targets {
+		i := i
+		go func() {
+			defer wg.Done()
+			results[i] = testNodeTarget(targets[i], timeout)
+		}()
+	}
+	wg.Wait()
+	return results
+}
+
+func testNodeTarget(target nodeTestTarget, timeout time.Duration) nodeTestResult {
+	result := nodeTestResult{Target: target}
+	if strings.TrimSpace(target.Server) == "" {
+		result.Err = errors.New("server is empty")
+		return result
+	}
+	if err := validatePort(target.Port); err != nil {
+		result.Err = err
+		return result
+	}
+
+	address := nodeTestAddress(target)
+	start := time.Now()
+	conn, err := net.DialTimeout("tcp", address, timeout)
+	result.Duration = time.Since(start)
+	if err != nil {
+		result.Err = err
+		return result
+	}
+	_ = conn.Close()
+	return result
+}
+
+func nodeTestAddress(target nodeTestTarget) string {
+	if strings.TrimSpace(target.Server) == "" || target.Port <= 0 {
+		return ""
+	}
+	return joinHostPort(target.Server, target.Port)
+}
+
+func formatNodeTestTarget(target nodeTestTarget) string {
+	label := target.Tag
+	if target.Name != "" {
+		label = fmt.Sprintf("%s tag=%s", target.Name, target.Tag)
+	}
+	if target.Type == "" {
+		return fmt.Sprintf("%s %s", target.Kind, label)
+	}
+	return fmt.Sprintf("%s %s %s", target.Kind, target.Type, label)
+}
+
+func formatNodeTestError(err error) string {
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return "timeout"
+	}
+	return err.Error()
+}
+
+func formatDuration(d time.Duration) string {
+	if d < time.Millisecond {
+		return "<1ms"
+	}
+	if d < time.Second {
+		return fmt.Sprintf("%dms", d.Milliseconds())
+	}
+	return fmt.Sprintf("%.2fs", d.Seconds())
+}
+
+func removeInteractive(app appConfig, reader *bufio.Reader, stdout, stderr io.Writer) error {
+	st, err := loadState(app.statePath)
+	if err != nil {
+		return err
+	}
+	cfg, err := loadConfigOrBase(app.configPath)
+	if err != nil {
+		return err
+	}
+	exits := httpOutbounds(cfg)
+	if len(st.Profiles) == 0 && len(exits) == 0 {
+		fmt.Fprintln(stdout, "no removable nodes")
+		return nil
+	}
+
+	fmt.Fprintln(stdout, "Remove node:")
+	fmt.Fprintf(stdout, "  1) profile/inbound (%d)\n", len(st.Profiles))
+	fmt.Fprintf(stdout, "  2) HTTP exit (%d)\n", len(exits))
+	fmt.Fprintln(stdout, "  0) exit")
+	for {
+		choice, err := promptLine(reader, stdout, "Choice: ")
+		if err != nil {
+			return err
+		}
+		switch strings.ToLower(choice) {
+		case "1", "profile", "profiles", "inbound", "inbounds", "node", "nodes":
+			if len(st.Profiles) == 0 {
+				fmt.Fprintln(stdout, "no profiles to remove")
+				continue
+			}
+			selected, err := promptProfilesForRemoval(reader, stdout, st.Profiles)
+			if err != nil {
+				return err
+			}
+			if len(selected) == 0 {
+				fmt.Fprintln(stdout, "cancelled")
+				return nil
+			}
+			for _, p := range selected {
+				fmt.Fprintf(stdout, "  remove profile %s  %s  :%d  tag=%s\n", p.Type, p.Name, p.Port, p.Tag)
+			}
+			yes, err := promptYesNo(reader, stdout, "Remove selected profile(s)? [y/N]: ", false)
+			if err != nil {
+				return err
+			}
+			if !yes {
+				fmt.Fprintln(stdout, "cancelled")
+				return nil
+			}
+			tags := make([]string, 0, len(selected))
+			for _, p := range selected {
+				tags = append(tags, p.Tag)
+			}
+			return removeProfiles(app, tags, true, stdout, stderr)
+		case "2", "http", "http-exit", "http exit", "exit-node", "exit node", "outbound", "outbounds":
+			if len(exits) == 0 {
+				fmt.Fprintln(stdout, "no HTTP exits to remove")
+				continue
+			}
+			selected, err := promptHTTPOutboundsForRemoval(reader, stdout, exits)
+			if err != nil {
+				return err
+			}
+			if len(selected) == 0 {
+				fmt.Fprintln(stdout, "cancelled")
+				return nil
+			}
+			for _, outbound := range selected {
+				fmt.Fprintf(stdout, "  remove HTTP exit %s  %s:%d\n", outbound.Tag, outbound.Server, outbound.Port)
+			}
+			yes, err := promptYesNo(reader, stdout, "Remove selected HTTP exit(s)? [y/N]: ", false)
+			if err != nil {
+				return err
+			}
+			if !yes {
+				fmt.Fprintln(stdout, "cancelled")
+				return nil
+			}
+			tags := make([]string, 0, len(selected))
+			for _, outbound := range selected {
+				tags = append(tags, outbound.Tag)
+			}
+			return removeHTTPOutbounds(app, tags, true, stdout, stderr)
+		case "0", "q", "quit", "exit":
+			fmt.Fprintln(stdout, "cancelled")
+			return nil
+		default:
+			fmt.Fprintln(stdout, "please choose profile, HTTP exit, or exit")
+		}
+	}
+}
+
+func promptProfilesForRemoval(reader *bufio.Reader, w io.Writer, profiles []profile) ([]profile, error) {
+	fmt.Fprintln(w, "Select profiles to remove:")
+	fmt.Fprintln(w, "  a) all")
+	fmt.Fprintln(w, "  0) exit")
+	for i, p := range profiles {
+		fmt.Fprintf(w, "  %d) %s  %s  :%d\n", i+1, p.Type, p.Name, p.Port)
+	}
+	for {
+		choice, err := promptLine(reader, w, "Choice: ")
+		if err != nil {
+			return nil, err
+		}
+		selected, err := selectProfiles(profiles, choice)
+		if err != nil {
+			fmt.Fprintf(w, "invalid input: %v\n", err)
+			continue
+		}
+		return selected, nil
+	}
+}
+
+func promptHTTPOutboundsForRemoval(reader *bufio.Reader, w io.Writer, outbounds []outboundInfo) ([]outboundInfo, error) {
+	fmt.Fprintln(w, "Select HTTP exits to remove:")
+	fmt.Fprintln(w, "  a) all")
+	fmt.Fprintln(w, "  0) exit")
+	for i, outbound := range outbounds {
+		fmt.Fprintf(w, "  %d) %s  %s:%d\n", i+1, outbound.Tag, outbound.Server, outbound.Port)
+	}
+	for {
+		choice, err := promptLine(reader, w, "Choice: ")
+		if err != nil {
+			return nil, err
+		}
+		selected, err := selectHTTPOutbounds(outbounds, choice)
+		if err != nil {
+			fmt.Fprintf(w, "invalid input: %v\n", err)
+			continue
+		}
+		return selected, nil
+	}
+}
+
+func selectHTTPOutbounds(outbounds []outboundInfo, choice string) ([]outboundInfo, error) {
+	choice = strings.TrimSpace(strings.ToLower(choice))
+	if choice == "" || choice == "a" || choice == "all" || choice == "*" {
+		return append([]outboundInfo(nil), outbounds...), nil
+	}
+	if choice == "0" || choice == "q" || choice == "quit" || choice == "exit" {
+		return nil, nil
+	}
+
+	parts := strings.FieldsFunc(choice, func(r rune) bool {
+		return r == ',' || r == ' ' || r == '\t'
+	})
+	if len(parts) == 0 {
+		return nil, errors.New("choose all, exit, or HTTP exit numbers")
+	}
+	selected := make([]outboundInfo, 0, len(parts))
+	seen := map[int]bool{}
+	for _, part := range parts {
+		index, err := strconv.Atoi(part)
+		if err != nil {
+			return nil, fmt.Errorf("%q is not an HTTP exit number", part)
+		}
+		if index < 1 || index > len(outbounds) {
+			return nil, fmt.Errorf("HTTP exit number %d is out of range", index)
+		}
+		if seen[index] {
+			continue
+		}
+		seen[index] = true
+		selected = append(selected, outbounds[index-1])
+	}
+	return selected, nil
+}
+
+func removeProfiles(app appConfig, tags []string, restart bool, stdout, stderr io.Writer) error {
+	tags = cleanUniqueTags(tags)
+	if len(tags) == 0 {
+		return errors.New("no profile tags selected")
+	}
+
+	st, err := loadState(app.statePath)
+	if err != nil {
+		return err
+	}
+	cfg, err := loadConfigOrBase(app.configPath)
+	if err != nil {
+		return err
+	}
+
+	selected := stringSet(tags)
+	keptProfiles := make([]profile, 0, len(st.Profiles))
+	profilesRemoved := 0
+	for _, p := range st.Profiles {
+		if selected[p.Tag] {
+			profilesRemoved++
+			continue
+		}
+		keptProfiles = append(keptProfiles, p)
+	}
+	st.Profiles = keptProfiles
+
+	inboundsRemoved := removeTaggedItems(cfg, "inbounds", selected)
+	routeCleanup := removeInboundTagsFromRouteRules(cfg, tags)
+	if profilesRemoved == 0 && inboundsRemoved == 0 {
+		return errors.New("no matching profiles")
+	}
+
+	wr, err := writeConfig(app.configPath, cfg)
+	if err != nil {
+		return err
+	}
+	if err := checkSingBoxConfig(app.configPath); err != nil {
+		restoreBackup(app.configPath, wr.BackupPath, stderr)
+		return err
+	}
+	if err := saveState(app.statePath, st); err != nil {
+		restoreBackup(app.configPath, wr.BackupPath, stderr)
+		return err
+	}
+
+	fmt.Fprintf(stdout, "removed %d profile(s), %d inbound(s)\n", profilesRemoved, inboundsRemoved)
+	if routeCleanup.Removed > 0 || routeCleanup.Updated > 0 {
+		fmt.Fprintf(stdout, "cleaned route rules: %d removed, %d updated\n", routeCleanup.Removed, routeCleanup.Updated)
+	}
+	if restart {
+		return restartSingBox(app, stdout, stderr)
+	}
+	return nil
+}
+
+func removeHTTPOutbounds(app appConfig, tags []string, restart bool, stdout, stderr io.Writer) error {
+	tags = cleanUniqueTags(tags)
+	if len(tags) == 0 {
+		return errors.New("no HTTP exit tags selected")
+	}
+	selected := stringSet(tags)
+	if selected["direct"] {
+		return errors.New("direct outbound cannot be removed")
+	}
+
+	cfg, err := loadConfigOrBase(app.configPath)
+	if err != nil {
+		return err
+	}
+	outboundsRemoved := removeHTTPOutboundsFromConfig(cfg, selected)
+	routeCleanup := removeRouteRulesByOutboundTags(cfg, tags)
+	if outboundsRemoved == 0 {
+		return errors.New("no matching HTTP exits")
+	}
+
+	wr, err := writeConfig(app.configPath, cfg)
+	if err != nil {
+		return err
+	}
+	if err := checkSingBoxConfig(app.configPath); err != nil {
+		restoreBackup(app.configPath, wr.BackupPath, stderr)
+		return err
+	}
+
+	fmt.Fprintf(stdout, "removed %d HTTP exit(s)\n", outboundsRemoved)
+	if routeCleanup.Removed > 0 {
+		fmt.Fprintf(stdout, "removed %d route rule(s) referencing removed exit(s)\n", routeCleanup.Removed)
+	}
+	if restart {
+		return restartSingBox(app, stdout, stderr)
+	}
+	return nil
+}
+
 func rulesInteractive(app appConfig, reader *bufio.Reader, stdout, stderr io.Writer) error {
 	st, err := loadState(app.statePath)
 	if err != nil {
@@ -1750,6 +2180,136 @@ func setInboundExitRules(cfg map[string]any, inboundTags []string, outboundTag s
 	return nil
 }
 
+func removeTaggedItems(cfg map[string]any, key string, tags map[string]bool) int {
+	items, ok := cfg[key].([]any)
+	if !ok {
+		return 0
+	}
+	kept := make([]any, 0, len(items))
+	removed := 0
+	for _, raw := range items {
+		item, ok := raw.(map[string]any)
+		if !ok {
+			kept = append(kept, raw)
+			continue
+		}
+		tag, _ := item["tag"].(string)
+		if tags[tag] {
+			removed++
+			continue
+		}
+		kept = append(kept, raw)
+	}
+	cfg[key] = kept
+	return removed
+}
+
+func removeHTTPOutboundsFromConfig(cfg map[string]any, tags map[string]bool) int {
+	outbounds, ok := cfg["outbounds"].([]any)
+	if !ok {
+		return 0
+	}
+	kept := make([]any, 0, len(outbounds))
+	removed := 0
+	for _, raw := range outbounds {
+		outbound, ok := raw.(map[string]any)
+		if !ok {
+			kept = append(kept, raw)
+			continue
+		}
+		tag, _ := outbound["tag"].(string)
+		outboundType, _ := outbound["type"].(string)
+		if tags[tag] && outboundType == "http" {
+			removed++
+			continue
+		}
+		kept = append(kept, raw)
+	}
+	cfg["outbounds"] = kept
+	return removed
+}
+
+func removeInboundTagsFromRouteRules(cfg map[string]any, inboundTags []string) routeCleanupResult {
+	selected := stringSet(cleanUniqueTags(inboundTags))
+	if len(selected) == 0 {
+		return routeCleanupResult{}
+	}
+	route, ok := cfg["route"].(map[string]any)
+	if !ok {
+		return routeCleanupResult{}
+	}
+	rules, ok := route["rules"].([]any)
+	if !ok {
+		return routeCleanupResult{}
+	}
+
+	var result routeCleanupResult
+	kept := make([]any, 0, len(rules))
+	for _, raw := range rules {
+		rule, ok := raw.(map[string]any)
+		if !ok {
+			kept = append(kept, raw)
+			continue
+		}
+		existingTags := inboundTagsFromRule(rule)
+		if len(existingTags) == 0 {
+			kept = append(kept, raw)
+			continue
+		}
+		remainingTags := make([]string, 0, len(existingTags))
+		removedFromRule := false
+		for _, tag := range existingTags {
+			if selected[tag] {
+				removedFromRule = true
+				continue
+			}
+			remainingTags = append(remainingTags, tag)
+		}
+		if !removedFromRule {
+			kept = append(kept, raw)
+			continue
+		}
+		if len(remainingTags) == 0 {
+			result.Removed++
+			continue
+		}
+		next := cloneStringAnyMap(rule)
+		next["inbound"] = stringListAsAny(remainingTags)
+		kept = append(kept, next)
+		result.Updated++
+	}
+	route["rules"] = kept
+	return result
+}
+
+func removeRouteRulesByOutboundTags(cfg map[string]any, outboundTags []string) routeCleanupResult {
+	selected := stringSet(cleanUniqueTags(outboundTags))
+	if len(selected) == 0 {
+		return routeCleanupResult{}
+	}
+	route, ok := cfg["route"].(map[string]any)
+	if !ok {
+		return routeCleanupResult{}
+	}
+	rules, ok := route["rules"].([]any)
+	if !ok {
+		return routeCleanupResult{}
+	}
+
+	var result routeCleanupResult
+	kept := make([]any, 0, len(rules))
+	for _, raw := range rules {
+		rule, ok := raw.(map[string]any)
+		if ok && selected[routeRuleOutbound(rule)] {
+			result.Removed++
+			continue
+		}
+		kept = append(kept, raw)
+	}
+	route["rules"] = kept
+	return result
+}
+
 func ensureRoute(cfg map[string]any) map[string]any {
 	route, ok := cfg["route"].(map[string]any)
 	if !ok {
@@ -1847,6 +2407,17 @@ func cleanUniqueTags(tags []string) []string {
 	}
 	sort.Strings(cleaned)
 	return cleaned
+}
+
+func stringSet(values []string) map[string]bool {
+	set := make(map[string]bool, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value != "" {
+			set[value] = true
+		}
+	}
+	return set
 }
 
 func cloneStringAnyMap(in map[string]any) map[string]any {
@@ -1965,7 +2536,7 @@ func buildLink(p profile) (string, error) {
 		userInfo := base64.RawURLEncoding.EncodeToString([]byte(p.Method + ":" + p.Password))
 		u := url.URL{
 			Scheme:   "ss",
-			Host:     net.JoinHostPort(p.Server, strconv.Itoa(p.Port)),
+			Host:     joinHostPort(p.Server, p.Port),
 			Fragment: p.Name,
 		}
 		u.User = url.User(userInfo)
@@ -1979,7 +2550,7 @@ func buildLink(p profile) (string, error) {
 		u := url.URL{
 			Scheme:   "vless",
 			User:     url.User(p.UUID),
-			Host:     net.JoinHostPort(p.Server, strconv.Itoa(p.Port)),
+			Host:     joinHostPort(p.Server, p.Port),
 			Fragment: p.Name,
 		}
 		q := u.Query()
@@ -2190,6 +2761,14 @@ func validateServer(server string) error {
 		}
 	}
 	return nil
+}
+
+func joinHostPort(host string, port int) string {
+	host = strings.TrimSpace(host)
+	if strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
+		host = strings.TrimPrefix(strings.TrimSuffix(host, "]"), "[")
+	}
+	return net.JoinHostPort(host, strconv.Itoa(port))
 }
 
 func validateShortID(shortID string) error {

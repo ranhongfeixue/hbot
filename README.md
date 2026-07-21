@@ -106,6 +106,8 @@ After setup, it opens the function menu:
 6) restart
 7) start
 8) stop
+9) test
+10) remove
 0) exit
 ```
 
@@ -204,6 +206,33 @@ hbot writes sing-box route rules in this shape:
 ```
 
 Only selected profiles get explicit rules. Profiles without rules keep the default direct/own exit.
+
+## Test Nodes
+
+Choose `test` to test all saved profiles and HTTP exits at once.
+
+- profile nodes: TCP connect to the saved server and profile port
+- HTTP exits: TCP connect to the HTTP outbound server and port
+- timeout: 5 seconds per node
+
+The test runs concurrently and prints `OK` or `FAIL` with latency or error details.
+
+## Remove Nodes
+
+Choose `remove` to delete either profile/inbound nodes or HTTP exit nodes.
+
+Removing a profile:
+
+- deletes it from `/etc/hbot/state.json`
+- removes its sing-box inbound
+- removes that inbound tag from route rules
+- restarts sing-box
+
+Removing an HTTP exit:
+
+- removes the HTTP outbound
+- removes route rules that point to the deleted exit
+- restarts sing-box
 
 ## Export Clash
 
